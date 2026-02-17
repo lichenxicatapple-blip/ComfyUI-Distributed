@@ -76,8 +76,8 @@ class CloudflareTunnelManager:
             return "cloudflared-windows-amd64.exe"
         if system == "darwin":
             if machine in ("arm64", "aarch64"):
-                return "cloudflared-darwin-arm64"
-            return "cloudflared-darwin-amd64"
+                return "cloudflared-darwin-arm64.tgz"
+            return "cloudflared-darwin-amd64.tgz"
         if system == "linux":
             if machine in ("arm64", "aarch64"):
                 return "cloudflared-linux-arm64"
@@ -94,12 +94,21 @@ class CloudflareTunnelManager:
         debug_log(f"Downloading cloudflared from {url}")
         try:
             with request.urlopen(url, timeout=30) as resp:
-                with open(target_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                if asset.endswith(".tgz"):
+                    import tarfile
+                    import io
+                    data = resp.read()
+                    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                        member = next(m for m in tar.getmembers() if m.name.endswith("cloudflared"))
+                        with tar.extractfile(member) as src:
+                            with open(target_path, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                else:
+                    with open(target_path, "wb") as f:
+                        shutil.copyfileobj(resp, f)
         except urlerror.URLError as exc:
             raise RuntimeError(f"Failed to download cloudflared: {exc}") from exc
 
-        # Make executable
         st = os.stat(target_path)
         os.chmod(target_path, st.st_mode | stat.S_IEXEC)
         debug_log(f"Downloaded cloudflared to {target_path}")
@@ -168,8 +177,20 @@ class CloudflareTunnelManager:
             self.status = tunnel_cfg.get("status", "running")
             debug_log(f"Detected existing cloudflared process (pid={pid})")
         else:
+            # Restore master host if it still points to the dead tunnel URL
+            restore_host = None
+            if self.public_url and self.previous_master_host:
+                active_host = _normalize_host(self.public_url)
+                current_host = _normalize_host((cfg.get("master") or {}).get("host"))
+                if current_host and current_host == active_host:
+                    restore_host = self.previous_master_host
+                    debug_log(f"Restoring master host from dead tunnel URL to {restore_host}")
+
             # Clear stale info
-            self._persist_state(status="stopped", public_url="", pid=None, log_file=None)
+            self._persist_state(
+                status="stopped", public_url="", pid=None, log_file=None,
+                master_host=restore_host
+            )
             self.status = "stopped"
             self.pid = None
 

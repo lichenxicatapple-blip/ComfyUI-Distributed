@@ -4,35 +4,51 @@ import sys
 # Add the directory to Python path
 sys.path.append(os.path.dirname(__file__))
 
-# Patch ComfyUI execution validation for DistributedVideoCollector
+# Patch ComfyUI execution validation and progress forwarding
 try:
     import execution
+    import server
     from .distributed import ImageBatchDivider
-    
-    # Store original validate function if it exists
+    from . import worker_progress_reporter
+
     if hasattr(execution, 'validate_outputs'):
         original_validate_outputs = execution.validate_outputs
-        
+
         def patched_validate_outputs(executor, node_id, result, node_class):
             if node_class == ImageBatchDivider:
-                return  # Skip validation for our dynamic output node
+                return
             return original_validate_outputs(executor, node_id, result, node_class)
-        
+
         execution.validate_outputs = patched_validate_outputs
-    else:
-        # Fallback: patch the main execute method if validate_outputs doesn't exist
-        if hasattr(execution.PromptExecutor, 'execute'):
-            original_execute = execution.PromptExecutor.execute
-            
-            def patched_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-                # This is a more complex patch - for now just call original
-                # The ByPassTypeTuple should handle most validation issues
+
+    if hasattr(execution.PromptExecutor, 'execute'):
+        original_execute = execution.PromptExecutor.execute
+
+        def patched_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+            ps = server.PromptServer.instance
+            ps._distributed_active_prompt_id = prompt_id
+
+            master_url = None
+            for node_data in prompt.values():
+                inputs = node_data.get("inputs", {})
+                if inputs.get("enable_progress_forwarding"):
+                    master_url = inputs.get("master_url")
+                    break
+
+            if master_url:
+                worker_progress_reporter.activate(master_url)
+
+            try:
                 return original_execute(self, prompt, prompt_id, extra_data, execute_outputs)
-            
-            execution.PromptExecutor.execute = patched_execute
-            
+            finally:
+                ps._distributed_active_prompt_id = None
+                if master_url:
+                    worker_progress_reporter.deactivate()
+
+        execution.PromptExecutor.execute = patched_execute
+
 except ImportError:
-    pass  # ComfyUI execution module not available during import
+    pass
 
 # Import everything needed from the main module
 from .distributed import (

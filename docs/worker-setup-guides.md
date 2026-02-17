@@ -146,3 +146,20 @@ comfy model download --url https://huggingface.co/black-forest-labs/FLUX.1-dev/r
    - **Host**: The remote worker's IP address/domain
    - **Port**: 443
 9. **Save** the remote worker configuration.
+
+---
+
+### Note for ComfyUI Desktop App Users
+
+The Desktop app does not expose `--enable-cors-header` as a launch argument. To enable CORS manually, edit the following file:
+
+```
+<ComfyUI.app>/Contents/Resources/ComfyUI/comfy/cli_args.py
+```
+
+Find the line (around line 42):
+```python
+parser.add_argument("--enable-cors-header", type=str, default=None, ...)
+```
+
+Change `default=None` to `default="*"`, then restart the app. This change needs to be reapplied after each Desktop app update.

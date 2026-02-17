@@ -1717,7 +1717,7 @@ if not hasattr(prompt_server, 'distributed_pending_jobs'):
     prompt_server.distributed_pending_jobs = {}
     prompt_server.distributed_jobs_lock = asyncio.Lock()
 
-from .distributed_queue_api import orchestrate_distributed_execution
+from .distributed_queue_api import orchestrate_distributed_execution, _build_worker_url
 
 @server.PromptServer.instance.routes.post("/distributed/queue")
 async def distributed_queue_endpoint(request):
@@ -2036,6 +2036,40 @@ async def job_complete_endpoint(request):
         return await handle_api_error(request, e)
 
 
+@server.PromptServer.instance.routes.post("/distributed/worker_progress")
+async def worker_progress_endpoint(request):
+    try:
+        payload = await request.json()
+        event = payload.get("event")
+        data = payload.get("data")
+        if not event or data is None:
+            return web.json_response({"error": "missing event or data"}, status=400)
+
+        active_pid = getattr(prompt_server, "_distributed_active_prompt_id", None)
+        if active_pid and isinstance(data, dict):
+            data["prompt_id"] = active_pid
+            # progress_state has prompt_id inside each node entry too
+            if event == "progress_state":
+                nodes = data.get("nodes")
+                if isinstance(nodes, dict):
+                    for node_state in nodes.values():
+                        if isinstance(node_state, dict):
+                            node_state["prompt_id"] = active_pid
+
+        prompt_server.send_sync(event, data)
+        debug_log(f"worker_progress relayed: event={event}")
+
+        if event == "execution_error":
+            import comfy.model_management
+            comfy.model_management.interrupt_current_processing()
+            log(f"Worker execution error on node {data.get('node_id')}, interrupting master")
+
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        log(f"worker_progress relay error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+
 # --- Collector Node ---
 class DistributedCollectorNode:
     @classmethod
@@ -2052,6 +2086,7 @@ class DistributedCollectorNode:
                 "worker_id": ("STRING", {"default": ""}),
                 "pass_through": ("BOOLEAN", {"default": False}),
                 "delegate_only": ("BOOLEAN", {"default": False}),
+                "enable_progress_forwarding": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -2060,7 +2095,7 @@ class DistributedCollectorNode:
     FUNCTION = "run"
     CATEGORY = "image"
     
-    def run(self, images, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False, enable_progress_forwarding=False):
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
@@ -2081,52 +2116,66 @@ class DistributedCollectorNode:
         if batch_size == 0 and audio is None:
             return
 
+        max_retries = 3
+        url = f"{master_url}/distributed/job_complete"
+
         for start in range(0, batch_size, MAX_BATCH):
             chunk = image_batch[start:start + MAX_BATCH]
             chunk_size = chunk.shape[0]
             is_chunk_last = (start + chunk_size == batch_size)  # True only for final chunk
 
-            data = aiohttp.FormData()
-            data.add_field('multi_job_id', multi_job_id)
-            data.add_field('worker_id', str(worker_id))
-            data.add_field('is_last', str(is_chunk_last))
-            data.add_field('batch_size', str(chunk_size))
-
-            # Chunk metadata: Absolute index from full batch
-            metadata = [{'index': start + j} for j in range(chunk_size)]
-            data.add_field('images_metadata', json.dumps(metadata), content_type='application/json')
-
-            # Add chunk images
+            # Pre-encode images to bytes so retries don't need to re-encode
+            image_bytes_list = []
             for j in range(chunk_size):
-                # Convert tensor slice to PIL
                 img = tensor_to_pil(chunk[j:j+1], 0)
                 byte_io = io.BytesIO()
                 img.save(byte_io, format='PNG', compress_level=0)
-                byte_io.seek(0)
-                data.add_field(f'image_{j}', byte_io, filename=f'image_{j}.png', content_type='image/png')
+                image_bytes_list.append(byte_io.getvalue())
 
-            # Add audio data only on the final chunk to avoid duplication
+            metadata = [{'index': start + j} for j in range(chunk_size)]
+            metadata_json = json.dumps(metadata)
+
+            # Pre-encode audio bytes for final chunk
+            audio_bytes_raw = None
+            audio_sample_rate = None
             if is_chunk_last and audio is not None:
                 waveform = audio.get("waveform")
-                sample_rate = audio.get("sample_rate", 44100)
+                audio_sample_rate = audio.get("sample_rate", 44100)
                 if waveform is not None and waveform.numel() > 0:
-                    # Serialize waveform tensor to bytes
-                    audio_bytes = io.BytesIO()
-                    torch.save(waveform, audio_bytes)
-                    audio_bytes.seek(0)
-                    data.add_field('audio_waveform', audio_bytes, filename='audio.pt', content_type='application/octet-stream')
-                    data.add_field('audio_sample_rate', str(sample_rate))
-                    debug_log(f"Worker - Including audio: shape={waveform.shape}, sample_rate={sample_rate}")
+                    buf = io.BytesIO()
+                    torch.save(waveform, buf)
+                    audio_bytes_raw = buf.getvalue()
+                    debug_log(f"Worker - Including audio: shape={waveform.shape}, sample_rate={audio_sample_rate}")
 
-            try:
-                session = await get_client_session()
-                url = f"{master_url}/distributed/job_complete"
-                async with session.post(url, data=data) as response:
-                    response.raise_for_status()
-            except Exception as e:
-                log(f"Worker - Failed to send chunk to master: {e}")
-                debug_log(f"Worker - Full error details: URL={url}")
-                raise  # Re-raise to handle at caller level
+            for attempt in range(max_retries + 1):
+                data = aiohttp.FormData()
+                data.add_field('multi_job_id', multi_job_id)
+                data.add_field('worker_id', str(worker_id))
+                data.add_field('is_last', str(is_chunk_last))
+                data.add_field('batch_size', str(chunk_size))
+                data.add_field('images_metadata', metadata_json, content_type='application/json')
+
+                for j, img_bytes in enumerate(image_bytes_list):
+                    data.add_field(f'image_{j}', io.BytesIO(img_bytes), filename=f'image_{j}.png', content_type='image/png')
+
+                if audio_bytes_raw is not None:
+                    data.add_field('audio_waveform', io.BytesIO(audio_bytes_raw), filename='audio.pt', content_type='application/octet-stream')
+                    data.add_field('audio_sample_rate', str(audio_sample_rate))
+
+                try:
+                    session = await get_client_session()
+                    async with session.post(url, data=data) as response:
+                        response.raise_for_status()
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        wait = 2 ** attempt
+                        log(f"Worker - Failed to send chunk to master (attempt {attempt + 1}/{max_retries + 1}), retrying in {wait}s: {e}")
+                        await asyncio.sleep(wait)
+                    else:
+                        log(f"Worker - Failed to send chunk to master after {max_retries + 1} attempts: {e}")
+                        debug_log(f"Worker - Full error details: URL={url}")
+                        raise  # Re-raise to handle at caller level
 
     def _combine_audio(self, master_audio, worker_audio, empty_audio):
         """Combine audio from master and workers into a single audio output."""
@@ -2164,7 +2213,7 @@ class DistributedCollectorNode:
             log(f"Master - Error combining audio: {e}")
             return empty_audio
 
-    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False, enable_progress_forwarding=False):
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
         if is_worker:
@@ -2309,9 +2358,7 @@ class DistributedCollectorNode:
                                 if not wrec:
                                     debug_log(f"Collector probe: worker {wid} not found in config")
                                     continue
-                                host = normalize_host(wrec.get('host') or 'localhost') or 'localhost'
-                                port = int(wrec.get('port', 8188))
-                                url = f"http://{host}:{port}/prompt"
+                                url = _build_worker_url(wrec, "/prompt")
                                 try:
                                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
                                         status = resp.status
@@ -2396,6 +2443,22 @@ class DistributedCollectorNode:
                 raise
             
             total_collected = sum(len(imgs) for imgs in worker_images.values())
+
+            # In delegate-only mode, workers are the sole source of images.
+            # If none responded, raise a clear error instead of letting downstream
+            # nodes fail with a confusing "index out of bounds" on an empty tensor.
+            if total_collected == 0 and delegate_mode:
+                missing_workers = set(str(w) for w in enabled_workers) - workers_done
+                # Clean up job queue
+                async with prompt_server.distributed_jobs_lock:
+                    if multi_job_id in prompt_server.distributed_pending_jobs:
+                        del prompt_server.distributed_pending_jobs[multi_job_id]
+                raise RuntimeError(
+                    f"No images received from workers. "
+                    f"Workers that did not respond: {list(missing_workers)}. "
+                    f"This is usually caused by network issues between worker and master. "
+                    f"Check worker logs for details."
+                )
             
             # Clean up job queue
             async with prompt_server.distributed_jobs_lock:
@@ -2446,6 +2509,8 @@ class DistributedCollectorNode:
                 return (combined, combined_audio)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
+                if delegate_mode:
+                    raise
                 # Return just the master images as fallback
                 return (images, audio if audio is not None else empty_audio)
 

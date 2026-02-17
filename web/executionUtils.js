@@ -172,7 +172,8 @@ export async function executeParallelDistributed(extension, promptWrapper) {
                 enabled_worker_ids: activeWorkers.map(w => w.id), 
                 workflow: promptWrapper.workflow,
                 job_id_map: job_id_map, // Pass the map of unique IDs
-                delegate_master: masterDelegateActive && participantId === 'master'
+                delegate_master: masterDelegateActive && participantId === 'master',
+                master_delegate_active: masterDelegateActive
             };
             
             const jobApiPrompt = await prepareApiPromptForParticipant(
@@ -448,6 +449,9 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
                 // Also make the worker_job_id unique to prevent potential caching issues
                 inputs.worker_job_id = `${uniqueJobId}_worker_${participantId}`;
                 inputs.worker_id = participantId;
+                if (options.master_delegate_active && options.enabled_worker_ids && options.enabled_worker_ids.length === 1) {
+                    inputs.enable_progress_forwarding = true;
+                }
             }
         }
     }

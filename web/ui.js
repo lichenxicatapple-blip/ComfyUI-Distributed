@@ -1090,6 +1090,20 @@ export class DistributedUI {
         tunnelBtn.id = "cloudflare-tunnel-button";
         tunnelBtn.style.cssText = BUTTON_STYLES.base + " background-color: #665533; margin: 4px 0 -5px 0;";
         settingsForm.appendChild(tunnelBtn);
+
+        // Auto-start tunnel checkbox
+        const autoStartRow = document.createElement("label");
+        autoStartRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ccc; margin: -2px 0 0 2px; cursor: pointer;";
+        const autoStartCb = document.createElement("input");
+        autoStartCb.type = "checkbox";
+        autoStartCb.checked = Boolean(extension.config?.settings?.auto_start_tunnel);
+        autoStartCb.addEventListener("change", () => {
+            extension._updateSetting("auto_start_tunnel", autoStartCb.checked);
+        });
+        autoStartRow.appendChild(autoStartCb);
+        autoStartRow.appendChild(document.createTextNode("Auto-start on launch"));
+        settingsForm.appendChild(autoStartRow);
+
         extension.tunnelElements = { button: tunnelBtn };
         extension.updateTunnelUIElements();
         

@@ -46,6 +46,15 @@ class DistributedExtension {
             this.loadManagedWorkers();
             // Detect master IP after everything is set up
             this.detectMasterIP();
+            // Auto-start Cloudflare tunnel if configured
+            if (this.config?.settings?.auto_start_tunnel) {
+                await this.refreshTunnelStatus();
+                const status = (this.tunnelStatus?.status || "stopped").toLowerCase();
+                if (status !== "running" && status !== "starting") {
+                    this.log("Auto-starting Cloudflare tunnel");
+                    this.handleTunnelToggle(null);
+                }
+            }
         });
     }
 
